@@ -621,12 +621,9 @@ sip_get_msg_reqresp(sip_msg_t *msg, const u_char *payload)
 const char *
 sip_get_msg_reqresp_str(sip_msg_t *msg)
 {
-    // Check if code has non-standard text
-    if (msg->resp_str) {
-        return msg->resp_str;
-    } else {
-        return sip_method_str(msg->reqresp);
-    }
+    // Always return standard RFC description
+    // Ignore custom server descriptions which may be wrong
+    return sip_method_str(msg->reqresp);
 }
 
 sip_msg_t *

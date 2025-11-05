@@ -64,6 +64,19 @@ Documentação oficial no formato man page do Unix/Linux:
 
 ---
 
+### 5. [FIX_RFC_STANDARD_DESCRIPTIONS.md](FIX_RFC_STANDARD_DESCRIPTIONS.md)
+**Correção: Descrições Padrão RFC para Códigos SIP**
+
+Documentação sobre a padronização das descrições:
+- Problema: Servidores enviando descrições incorretas (ex: "480 Forbidden")
+- Solução: Sempre usar descrições padrão RFC
+- Tabela completa de códigos SIP corretos
+- Resultado: Interface consistente e profissional
+
+**Público-alvo**: Desenvolvedores, mantenedores
+
+---
+
 ## Estrutura da Documentação
 
 ```
@@ -72,6 +85,7 @@ doc/
 ├── TECHNICAL_ANALYSIS.md                   # Análise técnica do projeto
 ├── DISCONNECT_COLUMNS_IMPLEMENTATION.md    # Detalhes de implementação
 ├── USER_GUIDE_DISCONNECT_COLUMNS.md        # Guia do usuário
+├── FIX_RFC_STANDARD_DESCRIPTIONS.md        # Correção de descrições RFC
 ├── sngrep.8                               # Man page
 ├── footer.html                            # Rodapé para documentação HTML
 └── ironlogo.png                          # Logo da Irontec
@@ -172,6 +186,14 @@ Para questões sobre a documentação:
 - Abra uma issue no GitHub
 - Contribua com pull requests
 - Consulte a comunidade no wiki
+
+## 📊 Última Correção Aplicada
+
+### Descrições RFC Padrão (Nov 2024)
+- **Problema**: Servidores enviando descrições incorretas (ex: "480 Forbidden")
+- **Solução**: Sempre usar descrições padrão RFC
+- **Arquivo**: `FIX_RFC_STANDARD_DESCRIPTIONS.md`
+- **Resultado**: Todas as descrições seguem o padrão RFC correto
 
 ---
 
