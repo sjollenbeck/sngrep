@@ -430,6 +430,10 @@ sip_check_packet(packet_t *packet)
         if (strlen(call->xcallid)) {
             call_add_xcall(sip_find_by_callid(call->xcallid), call);
         }
+    } else {
+        // Parse all messages to ensure sip_from and sip_to are populated
+        // This is needed for disconnect columns to work properly
+        sip_parse_msg_payload(msg, payload);
     }
 
     // Add the message to the call

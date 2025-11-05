@@ -78,6 +78,10 @@ struct sip_call {
     char *reasontxt;
     //! Last warning text value for this call
     int warning;
+    //! Who initiated the disconnect (From header of BYE message)
+    char *disconnect_by;
+    //! SIP response code for the BYE message
+    char *disconnect_code;
     //! List of calls with with this call as X-Call-Id
     vector_t *xcalls;
     //! Cseq from invite startint the call

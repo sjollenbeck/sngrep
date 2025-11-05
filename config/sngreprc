@@ -81,6 +81,8 @@
 ##    - state
 ##    - convdur
 ##    - totaldur
+##    - disconnectby
+##    - disconnectcode
 ##
 ## Examples:
 # set cl.column0 sipfrom

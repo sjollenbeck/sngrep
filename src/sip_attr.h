@@ -85,6 +85,10 @@ enum sip_attr_id {
     SIP_ATTR_REASON_TXT,
     //! Warning Header
     SIP_ATTR_WARNING,
+    //! Who initiated the disconnect (BYE sender)
+    SIP_ATTR_DISCONNECT_BY,
+    //! SIP Code of disconnection response
+    SIP_ATTR_DISCONNECT_CODE,
     //! SIP Attribute count
     SIP_ATTR_COUNT
 };

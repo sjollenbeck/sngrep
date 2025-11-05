@@ -84,6 +84,8 @@ call_destroy(sip_call_t *call)
     sng_free(call->callid);
     sng_free(call->xcallid);
     sng_free(call->reasontxt);
+    sng_free(call->disconnect_by);
+    sng_free(call->disconnect_code);
     sng_free(call);
 }
 
@@ -203,40 +205,296 @@ call_update_state(sip_call_t *call, sip_msg_t *msg)
 
     // Get current message Method / Response Code
     reqresp = msg->reqresp;
+    
+    // CRITICAL FIX: Check for BYE regardless of state
+    // BYE can come at any time and should always be processed
+    if (reqresp == SIP_METHOD_BYE) {
+        // BYE received - call is being terminated
+        // Always mark as COMPLETED when BYE is received
+        call->state = SIP_CALLSTATE_COMPLETED;
+        call->cend_msg = msg;
+        
+        // Store disconnect info
+        if (!call->disconnect_by) {
+            char src_addr[256];
+            sprintf(src_addr, "%s:%u", msg->packet->src.ip, msg->packet->src.port);
+            call->disconnect_by = strdup(src_addr);
+        }
+        if (!call->disconnect_code) {
+            call->disconnect_code = strdup("BYE");
+        }
+        // Continue processing to update other fields if needed
+    }
 
     // If this message is actually a call, get its current state
-    if (call->state) {
+    // Skip state changes if we just processed a BYE
+    if (call->state && reqresp != SIP_METHOD_BYE) {
         if (call->state == SIP_CALLSTATE_CALLSETUP) {
-            if (reqresp == SIP_METHOD_ACK && call->invitecseq == msg->cseq) {
-                // Alice and Bob are talking
-                call->state = SIP_CALLSTATE_INCALL;
-                call->cstart_msg = msg;
+            if (reqresp == SIP_METHOD_ACK) {
+                // Check if this ACK matches the current INVITE transaction
+                if (msg->cseq == call->invitecseq) {
+                    // Find the most recent response to this INVITE
+                    sip_msg_t *last_response = NULL;
+                    int i;
+                    for (i = call_msg_count(call) - 1; i >= 0; i--) {
+                        sip_msg_t *m = vector_item(call->msgs, i);
+                        if (!m) continue;
+                        // Look for response with same cseq as this ACK
+                        // Response CSeq should match the INVITE CSeq
+                        if (m->cseq == msg->cseq && m->reqresp >= 100 && m->reqresp < 700) {
+                            last_response = m;
+                            break;
+                        }
+                    }
+                    
+                    if (last_response) {
+                        if (last_response->reqresp >= 200 && last_response->reqresp < 300) {
+                            // 2xx response - call is established
+                            call->state = SIP_CALLSTATE_INCALL;
+                            call->cstart_msg = msg;
+                        } else if (last_response->reqresp == 407 || last_response->reqresp == 401) {
+                            // Auth challenge - stay in CALLSETUP, waiting for new INVITE
+                            // Do nothing, state remains CALLSETUP
+                        } else {
+                            // Other error response - call failed
+                            // State should have been changed by the error response handler
+                        }
+                    } else {
+                        // No response found for this ACK - might be timing issue
+                        // Check if there's a 200 OK with ANY CSeq for INVITE
+                        int i;
+                        for (i = call_msg_count(call) - 1; i >= 0; i--) {
+                            sip_msg_t *m = vector_item(call->msgs, i);
+                            if (m && m->reqresp == 200) {
+                                // Found a 200 OK, assume call is established
+                                call->state = SIP_CALLSTATE_INCALL;
+                                call->cstart_msg = msg;
+                                break;
+                            }
+                        }
+                    }
+                }
+                // ACK with different CSeq - ignore (probably for older transaction)
             } else if (reqresp == SIP_METHOD_CANCEL) {
                 // Alice is not in the mood
                 call->state = SIP_CALLSTATE_CANCELLED;
-            } else if ((reqresp == 480) || (reqresp == 486) || (reqresp == 600 )) {
-                // Bob is busy
+                // Store who sent the CANCEL - just IP:port
+                if (!call->disconnect_by) {
+                    char src_addr[256];
+                    sprintf(src_addr, "%s:%u", msg->packet->src.ip, msg->packet->src.port);
+                    call->disconnect_by = strdup(src_addr);
+                }
+                // Initial disconnect code (may be updated by 487 later)
+                if (!call->disconnect_code) {
+                    call->disconnect_code = strdup("CANCELLED");
+                }
+            } else if ((reqresp == 480) || (reqresp == 486) || (reqresp == 600)) {
+                // Bob is busy - can happen even after 183/180 
                 call->state = SIP_CALLSTATE_BUSY;
-            } else if (reqresp > 400 && call->invitecseq == msg->cseq) {
-                // Bob is not in the mood
+                // Store the busy response
+                if (!call->disconnect_code) {
+                    const char *resp_str = sip_get_msg_reqresp_str(msg);
+                    if (resp_str) {
+                        call->disconnect_code = strdup(resp_str);
+                    } else {
+                        char code_str[32];
+                        sprintf(code_str, "%d", reqresp);
+                        call->disconnect_code = strdup(code_str);
+                    }
+                }
+                // Store who sent the busy response
+                if (!call->disconnect_by) {
+                    char src_addr[256];
+                    sprintf(src_addr, "%s:%u", msg->packet->src.ip, msg->packet->src.port);
+                    call->disconnect_by = strdup(src_addr);
+                }
+            } else if (reqresp == 603) {
+                // Bob declined the call (603 Decline)
                 call->state = SIP_CALLSTATE_REJECTED;
+                // Store the decline response
+                if (!call->disconnect_code) {
+                    const char *resp_str = sip_get_msg_reqresp_str(msg);
+                    if (resp_str) {
+                        call->disconnect_code = strdup(resp_str);
+                    } else {
+                        call->disconnect_code = strdup("603 Decline");
+                    }
+                }
+                // Store who declined (source of 603)
+                if (!call->disconnect_by) {
+                    char src_addr[256];
+                    sprintf(src_addr, "%s:%u", msg->packet->src.ip, msg->packet->src.port);
+                    call->disconnect_by = strdup(src_addr);
+                }
+            } else if (reqresp == 200) {
+                // 200 OK - check if it's for INVITE
+                // First check if CSeq matches current INVITE
+                if (msg->cseq == call->invitecseq) {
+                    // 200 OK for INVITE - call is established
+                    call->state = SIP_CALLSTATE_INCALL;
+                } else {
+                    // CSeq mismatch - could be auth scenario
+                    // Check if this is a 200 OK for any INVITE in this call
+                    int i;
+                    for (i = 0; i < call_msg_count(call); i++) {
+                        sip_msg_t *m = vector_item(call->msgs, i);
+                        if (m && m->reqresp == SIP_METHOD_INVITE && m->cseq == msg->cseq) {
+                            // Found matching INVITE for this 200 OK
+                            call->state = SIP_CALLSTATE_INCALL;
+                            call->invitecseq = msg->cseq;  // Update to correct CSeq
+                            break;
+                        }
+                    }
+                }
+            } else if (reqresp == 487 && call->invitecseq == msg->cseq) {
+                // 487 Request Terminated - call was cancelled
+                call->state = SIP_CALLSTATE_CANCELLED;
+                // Store who terminated
+                if (!call->disconnect_by) {
+                    char src_addr[256];
+                    sprintf(src_addr, "%s:%u", msg->packet->src.ip, msg->packet->src.port);
+                    call->disconnect_by = strdup(src_addr);
+                }
+                // Store the 487 response
+                if (!call->disconnect_code) {
+                    const char *resp_str = sip_get_msg_reqresp_str(msg);
+                    if (resp_str) {
+                        call->disconnect_code = strdup(resp_str);
+                    } else {
+                        call->disconnect_code = strdup("487 Request Terminated");
+                    }
+                }
+            } else if (reqresp > 400 && reqresp != 407 && reqresp != 401 && call->invitecseq == msg->cseq) {
+                // Bob is not in the mood (ignore auth challenges 401/407 and 487 which is handled above)
+                call->state = SIP_CALLSTATE_REJECTED;
+                // Store the rejection response
+                if (!call->disconnect_code) {
+                    const char *resp_str = sip_get_msg_reqresp_str(msg);
+                    if (resp_str) {
+                        call->disconnect_code = strdup(resp_str);
+                    } else {
+                        char code_str[32];
+                        sprintf(code_str, "%d", reqresp);
+                        call->disconnect_code = strdup(code_str);
+                    }
+                    // In case of rejection, store destination IP
+                    if (!call->disconnect_by) {
+                        char dst_addr[256];
+                        sprintf(dst_addr, "%s:%u", msg->packet->dst.ip, msg->packet->dst.port);
+                        call->disconnect_by = strdup(dst_addr);
+                    }
+                }
             } else if (reqresp == 181 || reqresp == 302 || reqresp == 301) {
                 // Bob has diversion
                 call->state = SIP_CALLSTATE_DIVERTED;
+                // Don't store disconnect info for 181 - wait for final response
+            } else if ((reqresp == 480 || reqresp == 404 || reqresp == 503 || reqresp == 488 || reqresp == 603) && 
+                       (call->state == SIP_CALLSTATE_DIVERTED || call->state == SIP_CALLSTATE_CALLSETUP)) {
+                // After diversion or during setup, got error response
+                // 480=Temporarily Unavailable, 404=Not Found, 503=Service Unavailable, 488=Not Acceptable, 603=Decline
+                if (!call->disconnect_code) {
+                    const char *resp_str = sip_get_msg_reqresp_str(msg);
+                    if (resp_str) {
+                        call->disconnect_code = strdup(resp_str);
+                    } else {
+                        char code_str[32];
+                        sprintf(code_str, "%d", reqresp);
+                        call->disconnect_code = strdup(code_str);
+                    }
+                }
+                // Store source IP (who sent the error)
+                if (!call->disconnect_by) {
+                    char addr[256];
+                    sprintf(addr, "%s:%u", msg->packet->src.ip, msg->packet->src.port);
+                    call->disconnect_by = strdup(addr);
+                }
+                // Update state based on response - keep DIVERTED if already diverted
+                if (call->state != SIP_CALLSTATE_DIVERTED) {
+                    if (reqresp == 480 || reqresp == 503) {
+                        call->state = SIP_CALLSTATE_BUSY;
+                    } else {
+                        call->state = SIP_CALLSTATE_REJECTED;
+                    }
+                }
+                // For DIVERTED calls, keep the state as DIVERTED even with 480
+            }
+        } else if (call->state == SIP_CALLSTATE_CANCELLED && reqresp == 487) {
+            // 487 Request Terminated after CANCEL - update the disconnect code
+            if (call->disconnect_code && strcmp(call->disconnect_code, "CANCELLED") == 0) {
+                // Update from generic "CANCELLED" to specific "487 Request Terminated"
+                sng_free(call->disconnect_code);
+                const char *resp_str = sip_get_msg_reqresp_str(msg);
+                if (resp_str) {
+                    call->disconnect_code = strdup(resp_str);
+                } else {
+                    call->disconnect_code = strdup("487 Request Terminated");
+                }
             }
         } else if (call->state == SIP_CALLSTATE_INCALL) {
-            if (reqresp == SIP_METHOD_BYE) {
-                // Thanks for all the fish!
-                call->state = SIP_CALLSTATE_COMPLETED;
-                call->cend_msg = msg;
+            // Handle messages during active call
+            // BYE is already handled above, so skip it here
+            if (reqresp == 603) {
+                // Call declined during active call (unusual but possible)
+                call->state = SIP_CALLSTATE_REJECTED;
+                if (!call->disconnect_code) {
+                    const char *resp_str = sip_get_msg_reqresp_str(msg);
+                    if (resp_str) {
+                        call->disconnect_code = strdup(resp_str);
+                    } else {
+                        call->disconnect_code = strdup("603 Decline");
+                    }
+                }
+                if (!call->disconnect_by) {
+                    char src_addr[256];
+                    sprintf(src_addr, "%s:%u", msg->packet->src.ip, msg->packet->src.port);
+                    call->disconnect_by = strdup(src_addr);
+                }
+            } else if (reqresp >= 200 && reqresp < 700 && msg->cseq > 0) {
+                // Check if this is a response to a BYE
+                sip_msg_t *bye_msg = NULL;
+                int i;
+                for (i = 0; i < call_msg_count(call); i++) {
+                    sip_msg_t *m = vector_item(call->msgs, i);
+                    if (m && m->reqresp == SIP_METHOD_BYE && m->cseq == msg->cseq) {
+                        bye_msg = m;
+                        break;
+                    }
+                }
+                if (bye_msg) {
+                    // BYE response received - ALWAYS mark call as completed
+                    call->state = SIP_CALLSTATE_COMPLETED;
+                    
+                    // Update disconnect code from BYE to the response
+                    if (call->disconnect_code && strcmp(call->disconnect_code, "BYE") == 0) {
+                        sng_free(call->disconnect_code);
+                        call->disconnect_code = NULL;
+                    }
+                    if (!call->disconnect_code) {
+                        // Store the response code for the BYE
+                        const char *resp_str = sip_get_msg_reqresp_str(msg);
+                        if (resp_str) {
+                            call->disconnect_code = strdup(resp_str);
+                        } else {
+                            char code_str[32];
+                            sprintf(code_str, "%d", reqresp);
+                            call->disconnect_code = strdup(code_str);
+                        }
+                    }
+                    // Store who confirmed the BYE if not already set
+                    if (!call->disconnect_by) {
+                        char addr[256];
+                        sprintf(addr, "%s:%u", msg->packet->src.ip, msg->packet->src.port);
+                        call->disconnect_by = strdup(addr);
+                    }
+                }
             }
         } else if (reqresp == SIP_METHOD_INVITE && call->state !=  SIP_CALLSTATE_INCALL) {
             // Call is being setup (after proper authentication)
             call->invitecseq = msg->cseq;
             call->state = SIP_CALLSTATE_CALLSETUP;
         }
-    } else {
-        // This is actually a call
+    } else if (reqresp != SIP_METHOD_BYE) {
+        // This is actually a call (but not a BYE which was already handled)
         if (reqresp == SIP_METHOD_INVITE) {
             call->invitecseq = msg->cseq;
             call->state = SIP_CALLSTATE_CALLSETUP;
@@ -287,6 +545,116 @@ call_get_attribute(sip_call_t *call, enum sip_attr_id id, char *value)
         case SIP_ATTR_WARNING:
             if (call->warning)
                 sprintf(value, "%d", call->warning);
+            break;
+        case SIP_ATTR_DISCONNECT_BY:
+            // Don't show disconnect info for calls still in setup
+            if (call->state == SIP_CALLSTATE_CALLSETUP) {
+                sprintf(value, "-");
+            } else if (call->disconnect_by) {
+                // Already stored as IP:port, just copy it
+                sprintf(value, "%s", call->disconnect_by);
+            } else if (call->state == SIP_CALLSTATE_CANCELLED || 
+                       call->state == SIP_CALLSTATE_REJECTED ||
+                       call->state == SIP_CALLSTATE_BUSY ||
+                       call->state == SIP_CALLSTATE_COMPLETED ||
+                       call->state == SIP_CALLSTATE_DIVERTED ||
+                       call->state == SIP_CALLSTATE_INCALL) {
+                // Fallback: Find who terminated the call
+                sip_msg_t *term_msg = NULL;
+                int i;
+                
+                // Find termination message (CANCEL, BYE, or final error response)
+                for (i = call_msg_count(call) - 1; i >= 0; i--) {
+                    sip_msg_t *m = vector_item(call->msgs, i);
+                    if (!m || !m->packet) continue;
+                    
+                    // Look for termination messages
+                    if (m->reqresp == SIP_METHOD_CANCEL || 
+                        m->reqresp == SIP_METHOD_BYE) {
+                        term_msg = m;
+                        break;
+                    }
+                    // Look for final error responses (skip auth challenges)
+                    if (m->reqresp >= 400 && m->reqresp < 700 && 
+                        m->reqresp != 401 && m->reqresp != 407) {
+                        term_msg = m;
+                        break;
+                    }
+                }
+                
+                if (term_msg && term_msg->packet) {
+                    // Show source IP:port of termination message
+                    sprintf(value, "%s:%u", term_msg->packet->src.ip, term_msg->packet->src.port);
+                } else if (call->state == SIP_CALLSTATE_INCALL) {
+                    // Call is still active, no disconnect yet
+                    sprintf(value, "-");
+                } else {
+                    // No termination found for ended call
+                    sprintf(value, "Unknown");
+                }
+            }
+            break;
+        case SIP_ATTR_DISCONNECT_CODE:
+            // Don't show disconnect code for calls still in setup
+            if (call->state == SIP_CALLSTATE_CALLSETUP) {
+                sprintf(value, "-");
+            } else if (call->disconnect_code) {
+                sprintf(value, "%s", call->disconnect_code);
+            } else if (call->state == SIP_CALLSTATE_INCALL) {
+                // Check if there's a BYE without response (timeout/lost)
+                int i;
+                sip_msg_t *bye_found = NULL;
+                for (i = call_msg_count(call) - 1; i >= 0; i--) {
+                    sip_msg_t *m = vector_item(call->msgs, i);
+                    if (m && m->reqresp == SIP_METHOD_BYE) {
+                        bye_found = m;
+                        sprintf(value, "BYE (No Response)");
+                        break;
+                    }
+                }
+                // If no BYE found, call is still active
+                if (!bye_found) {
+                    sprintf(value, "-");
+                }
+            } else if (call->state == SIP_CALLSTATE_CANCELLED) {
+                // Look for 487 response
+                int i;
+                for (i = 0; i < call_msg_count(call); i++) {
+                    sip_msg_t *m = vector_item(call->msgs, i);
+                    if (m && m->reqresp == 487) {
+                        sprintf(value, "487 Request Terminated");
+                        break;
+                    }
+                }
+                if (!strlen(value)) {
+                    sprintf(value, "CANCELLED");
+                }
+            } else if (call->state == SIP_CALLSTATE_DIVERTED) {
+                // Look for error response after diversion (480, 404, 503, etc.)
+                int i;
+                for (i = call_msg_count(call) - 1; i >= 0; i--) {
+                    sip_msg_t *m = vector_item(call->msgs, i);
+                    if (m && m->reqresp >= 400 && m->reqresp < 700 && 
+                        m->reqresp != 401 && m->reqresp != 407) {
+                        const char *resp_str = sip_get_msg_reqresp_str(m);
+                        if (resp_str) {
+                            sprintf(value, "%s", resp_str);
+                        } else {
+                            sprintf(value, "%d", m->reqresp);
+                        }
+                        break;
+                    }
+                }
+                if (!strlen(value)) {
+                    sprintf(value, "DIVERTED");
+                }
+            } else if (call->state == SIP_CALLSTATE_REJECTED) {
+                sprintf(value, "REJECTED");
+            } else if (call->state == SIP_CALLSTATE_BUSY) {
+                sprintf(value, "BUSY");
+            } else if (call->state == SIP_CALLSTATE_COMPLETED) {
+                sprintf(value, "BYE");
+            }
             break;
         default:
             return msg_get_attribute(vector_first(call->msgs), id, value);
